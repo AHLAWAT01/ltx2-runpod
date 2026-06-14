@@ -20,10 +20,11 @@ RUN git clone --depth 1 --branch ${LTX_REPO_REF} https://github.com/Lightricks/L
     && cd /opt/LTX-2 \
     && uv sync --frozen
 
-# Extra deps used by handler.py itself (RunPod SDK, HF downloader for weights).
-RUN cd /opt/LTX-2 && uv pip install --no-cache runpod huggingface_hub
+# Extra deps used by app.py itself (HTTP server, HF downloader for weights).
+# uv-managed venvs don't ship a pip binary, so install via `uv pip` instead.
+RUN cd /opt/LTX-2 && uv pip install --no-cache fastapi "uvicorn[standard]" huggingface_hub
 
-COPY handler.py /app/handler.py
+COPY app.py /app/app.py
 
 # Model assets (Lightricks/LTX-2.3 on HuggingFace). Override at deploy time if
 # Lightricks publishes new checkpoint filenames.
@@ -38,9 +39,10 @@ ENV WIDTH="768"
 ENV HEIGHT="512"
 
 # Weights (~71GB: 46GB distilled transformer + ~1GB upscaler + ~24GB Gemma-3-12B)
-# are cached on the RunPod network volume so they survive worker restarts and
-# aren't re-downloaded on every cold start.
-ENV HF_HOME="/runpod-volume/.cache/huggingface"
-ENV LTX_WEIGHTS_DIR="/runpod-volume/ltx2-weights"
+# are cached on the pod's network volume (mounted at /workspace by RunPod) so
+# they survive pod stop/start and aren't re-downloaded every time.
+ENV HF_HOME="/workspace/.cache/huggingface"
+ENV LTX_WEIGHTS_DIR="/workspace/ltx2-weights"
 
-CMD ["/opt/LTX-2/.venv/bin/python3", "-u", "/app/handler.py"]
+EXPOSE 8000
+CMD ["/opt/LTX-2/.venv/bin/uvicorn", "app:app", "--app-dir", "/app", "--host", "0.0.0.0", "--port", "8000"]
