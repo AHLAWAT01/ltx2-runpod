@@ -1,0 +1,2 @@
+runpod==1.7.*
+huggingface_hub
