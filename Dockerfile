@@ -21,7 +21,7 @@ RUN git clone --depth 1 --branch ${LTX_REPO_REF} https://github.com/Lightricks/L
     && uv sync --frozen
 
 # Extra deps used by handler.py itself (RunPod SDK, HF downloader for weights).
-RUN /opt/LTX-2/.venv/bin/pip install --no-cache-dir runpod huggingface_hub
+RUN cd /opt/LTX-2 && uv pip install --no-cache runpod huggingface_hub
 
 COPY handler.py /app/handler.py
 
