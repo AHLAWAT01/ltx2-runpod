@@ -1,21 +1,18 @@
-"""RunPod Serverless handler for LTX-2.3 (Lightricks) — video + synchronized
-audio in one model, run via the `ltx-pipelines` CLI (DistilledPipeline).
+"""LTX-2.3 (Lightricks) video+audio generation server, run as a persistent
+RunPod Pod (not Serverless) so the ~71GB of model weights stay on the pod's
+network volume across requests instead of re-downloading on every cold start.
 
 LTX-2.3 has no diffusers integration yet (the HF model card says diffusers
 support is "coming soon"). The image clones github.com/Lightricks/LTX-2 and
 runs `python -m ltx_pipelines.distilled` as a subprocess.
 
-Input (event["input"]):
-    prompt:       str   - text prompt describing the shot
-    duration_sec: float - target clip length in seconds
-    fps:          float - optional, defaults to FPS env var
-    width/height: int   - optional, defaults to WIDTH/HEIGHT env vars
-                          (final stage-2 resolution, must be divisible by 64)
+POST /generate
+    body: {"prompt": str, "duration_sec": float, "fps"?: float, "width"?: int, "height"?: int}
+    response: {"video_b64": "<base64 mp4>", "mime": "video/mp4"}
+              or {"error": "<message>"} on failure
 
-Output:
-    {"video_b64": "<base64 mp4>", "mime": "video/mp4"}
-    or {"error": "<message>"} on failure (runpod still reports the job COMPLETED;
-    the n8n workflow checks for the "error" key).
+GET /health
+    response: {"status": "ok"}
 """
 
 import base64
@@ -23,9 +20,9 @@ import os
 import subprocess
 import tempfile
 
+from fastapi import FastAPI
 from huggingface_hub import hf_hub_download, snapshot_download
-
-import runpod
+from pydantic import BaseModel
 
 LTX_REPO_ROOT = "/opt/LTX-2"
 LTX_PYTHON = "/opt/LTX-2/.venv/bin/python3"
@@ -35,7 +32,9 @@ DISTILLED_CHECKPOINT = os.environ.get("LTX_DISTILLED_CHECKPOINT", "ltx-2.3-22b-d
 SPATIAL_UPSCALER = os.environ.get("LTX_SPATIAL_UPSCALER", "ltx-2.3-spatial-upscaler-x2-1.1.safetensors")
 GEMMA_MODEL_REPO = os.environ.get("GEMMA_MODEL_REPO", "google/gemma-3-12b-it-qat-q4_0-unquantized")
 
-WEIGHTS_DIR = os.environ.get("LTX_WEIGHTS_DIR", "/runpod-volume/ltx2-weights")
+# RunPod Pods mount a network volume at /workspace by default — weights cached
+# here persist across pod stop/start (unlike Serverless, which is ephemeral).
+WEIGHTS_DIR = os.environ.get("LTX_WEIGHTS_DIR", "/workspace/ltx2-weights")
 HF_TOKEN = os.environ.get("HUGGINGFACE_API_TOKEN")
 
 DEFAULT_FPS = float(os.environ.get("FPS", "24"))
@@ -73,23 +72,39 @@ def _ensure_weights() -> tuple[str, str, str]:
     return checkpoint_path, upscaler_path, gemma_root
 
 
-# Downloaded once per worker (cold start); cached on the network volume across runs.
-_CHECKPOINT_PATH, _UPSCALER_PATH, _GEMMA_ROOT = _ensure_weights()
+app = FastAPI()
+
+# Downloaded on first request after pod start; cached on the network volume
+# (/workspace) so subsequent pod stop/start cycles skip the ~71GB download.
+_weights = None
 
 
-def handler(event):
-    job_input = event.get("input", {})
-    prompt = job_input.get("prompt")
-    duration_sec = float(job_input.get("duration_sec", 4))
-    fps = float(job_input.get("fps", DEFAULT_FPS))
-    width = int(job_input.get("width", DEFAULT_WIDTH))
-    height = int(job_input.get("height", DEFAULT_HEIGHT))
+class GenerateRequest(BaseModel):
+    prompt: str
+    duration_sec: float = 4
+    fps: float | None = None
+    width: int | None = None
+    height: int | None = None
 
-    if not prompt:
-        return {"error": "missing required field: prompt"}
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+@app.post("/generate")
+def generate(req: GenerateRequest):
+    global _weights
+    if _weights is None:
+        _weights = _ensure_weights()
+    checkpoint_path, upscaler_path, gemma_root = _weights
+
+    fps = req.fps or DEFAULT_FPS
+    width = req.width or DEFAULT_WIDTH
+    height = req.height or DEFAULT_HEIGHT
 
     # ltx-pipelines requires num_frames = 8*k + 1 for some non-negative integer k.
-    k = max(1, round((duration_sec * fps - 1) / 8))
+    k = max(1, round((req.duration_sec * fps - 1) / 8))
     num_frames = 8 * k + 1
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -97,10 +112,10 @@ def handler(event):
 
         cmd = [
             LTX_PYTHON, "-m", "ltx_pipelines.distilled",
-            "--distilled-checkpoint-path", _CHECKPOINT_PATH,
-            "--spatial-upsampler-path", _UPSCALER_PATH,
-            "--gemma-root", _GEMMA_ROOT,
-            "--prompt", prompt,
+            "--distilled-checkpoint-path", checkpoint_path,
+            "--spatial-upsampler-path", upscaler_path,
+            "--gemma-root", gemma_root,
+            "--prompt", req.prompt,
             "--output-path", out_path,
             "--height", str(height),
             "--width", str(width),
@@ -120,6 +135,3 @@ def handler(event):
             video_b64 = base64.b64encode(f.read()).decode("utf-8")
 
     return {"video_b64": video_b64, "mime": "video/mp4"}
-
-
-runpod.serverless.start({"handler": handler})
