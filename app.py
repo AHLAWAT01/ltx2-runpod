@@ -6,10 +6,18 @@ LTX-2.3 has no diffusers integration yet (the HF model card says diffusers
 support is "coming soon"). The image clones github.com/Lightricks/LTX-2 and
 runs `python -m ltx_pipelines.distilled` as a subprocess.
 
+RunPod's pod proxy is fronted by Cloudflare, which enforces a ~100s timeout
+on any single HTTP request — far shorter than a generation run. So this API
+is async: submit a job, then poll for its result.
+
 POST /generate
     body: {"prompt": str, "duration_sec": float, "fps"?: float, "width"?: int, "height"?: int}
-    response: {"video_b64": "<base64 mp4>", "mime": "video/mp4"}
-              or {"error": "<message>"} on failure
+    response: {"id": "<job_id>", "status": "IN_QUEUE"}
+
+GET /status/{job_id}
+    response: {"status": "IN_QUEUE" | "IN_PROGRESS" | "COMPLETED" | "FAILED",
+                "output"?: {"video_b64": "<base64 mp4>", "mime": "video/mp4"}
+                            or {"error": "<message>"}}
 
 GET /health
     response: {"status": "ok"}
@@ -19,8 +27,10 @@ import base64
 import os
 import subprocess
 import tempfile
+import threading
+import uuid
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from huggingface_hub import hf_hub_download, snapshot_download
 from pydantic import BaseModel
 
@@ -74,9 +84,15 @@ def _ensure_weights() -> tuple[str, str, str]:
 
 app = FastAPI()
 
-# Downloaded on first request after pod start; cached on the network volume
+# Downloaded on first job after pod start; cached on the network volume
 # (/workspace) so subsequent pod stop/start cycles skip the ~71GB download.
 _weights = None
+
+# In-memory job store: job_id -> {"status": ..., "output": ...}
+_jobs: dict[str, dict] = {}
+
+# Serializes GPU work — only one ltx_pipelines run at a time on a single GPU.
+_gpu_lock = threading.Lock()
 
 
 class GenerateRequest(BaseModel):
@@ -87,6 +103,60 @@ class GenerateRequest(BaseModel):
     height: int | None = None
 
 
+def _run_job(job_id: str, req: GenerateRequest):
+    global _weights
+    _jobs[job_id]["status"] = "IN_PROGRESS"
+
+    try:
+        with _gpu_lock:
+            if _weights is None:
+                _weights = _ensure_weights()
+            checkpoint_path, upscaler_path, gemma_root = _weights
+
+            fps = req.fps or DEFAULT_FPS
+            width = req.width or DEFAULT_WIDTH
+            height = req.height or DEFAULT_HEIGHT
+
+            # ltx-pipelines requires num_frames = 8*k + 1 for some non-negative integer k.
+            k = max(1, round((req.duration_sec * fps - 1) / 8))
+            num_frames = 8 * k + 1
+
+            with tempfile.TemporaryDirectory() as tmpdir:
+                out_path = os.path.join(tmpdir, "clip.mp4")
+
+                cmd = [
+                    LTX_PYTHON, "-m", "ltx_pipelines.distilled",
+                    "--distilled-checkpoint-path", checkpoint_path,
+                    "--spatial-upsampler-path", upscaler_path,
+                    "--gemma-root", gemma_root,
+                    "--prompt", req.prompt,
+                    "--output-path", out_path,
+                    "--height", str(height),
+                    "--width", str(width),
+                    "--num-frames", str(num_frames),
+                    "--frame-rate", str(fps),
+                ]
+                if LTX_QUANTIZATION:
+                    cmd += ["--quantization", LTX_QUANTIZATION]
+                if LTX_OFFLOAD_MODE:
+                    cmd += ["--offload", LTX_OFFLOAD_MODE]
+
+                result = subprocess.run(cmd, cwd=LTX_REPO_ROOT, capture_output=True, text=True)
+                if result.returncode != 0:
+                    _jobs[job_id]["status"] = "FAILED"
+                    _jobs[job_id]["output"] = {"error": f"ltx_pipelines.distilled failed: {result.stderr[-4000:]}"}
+                    return
+
+                with open(out_path, "rb") as f:
+                    video_b64 = base64.b64encode(f.read()).decode("utf-8")
+
+        _jobs[job_id]["status"] = "COMPLETED"
+        _jobs[job_id]["output"] = {"video_b64": video_b64, "mime": "video/mp4"}
+    except Exception as exc:
+        _jobs[job_id]["status"] = "FAILED"
+        _jobs[job_id]["output"] = {"error": str(exc)}
+
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
@@ -94,44 +164,15 @@ def health():
 
 @app.post("/generate")
 def generate(req: GenerateRequest):
-    global _weights
-    if _weights is None:
-        _weights = _ensure_weights()
-    checkpoint_path, upscaler_path, gemma_root = _weights
+    job_id = str(uuid.uuid4())
+    _jobs[job_id] = {"status": "IN_QUEUE", "output": None}
+    threading.Thread(target=_run_job, args=(job_id, req), daemon=True).start()
+    return {"id": job_id, "status": "IN_QUEUE"}
 
-    fps = req.fps or DEFAULT_FPS
-    width = req.width or DEFAULT_WIDTH
-    height = req.height or DEFAULT_HEIGHT
 
-    # ltx-pipelines requires num_frames = 8*k + 1 for some non-negative integer k.
-    k = max(1, round((req.duration_sec * fps - 1) / 8))
-    num_frames = 8 * k + 1
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        out_path = os.path.join(tmpdir, "clip.mp4")
-
-        cmd = [
-            LTX_PYTHON, "-m", "ltx_pipelines.distilled",
-            "--distilled-checkpoint-path", checkpoint_path,
-            "--spatial-upsampler-path", upscaler_path,
-            "--gemma-root", gemma_root,
-            "--prompt", req.prompt,
-            "--output-path", out_path,
-            "--height", str(height),
-            "--width", str(width),
-            "--num-frames", str(num_frames),
-            "--frame-rate", str(fps),
-        ]
-        if LTX_QUANTIZATION:
-            cmd += ["--quantization", LTX_QUANTIZATION]
-        if LTX_OFFLOAD_MODE:
-            cmd += ["--offload", LTX_OFFLOAD_MODE]
-
-        result = subprocess.run(cmd, cwd=LTX_REPO_ROOT, capture_output=True, text=True)
-        if result.returncode != 0:
-            return {"error": f"ltx_pipelines.distilled failed: {result.stderr[-4000:]}"}
-
-        with open(out_path, "rb") as f:
-            video_b64 = base64.b64encode(f.read()).decode("utf-8")
-
-    return {"video_b64": video_b64, "mime": "video/mp4"}
+@app.get("/status/{job_id}")
+def status(job_id: str):
+    job = _jobs.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="job not found")
+    return {"status": job["status"], "output": job["output"]}
