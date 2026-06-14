@@ -1,20 +1,31 @@
 # ltx2-runpod
 
-RunPod Serverless container running **LTX-2.3** (Lightricks, open-weight, 22B params) —
-generates a short video clip **with synchronized audio in a single model call**.
-Deployed separately from this repo's `docker-compose.yml`; called by
-`workflows/video_gen_workflow.json` via RunPod's HTTP API.
+RunPod **Pod** (not Serverless) running **LTX-2.3** (Lightricks, open-weight, 22B params) —
+generates a short video clip **with synchronized audio in a single model call**,
+served over HTTP. Deployed separately from this repo's `docker-compose.yml`;
+called by `workflows/video_gen_workflow.json` via the pod's public proxy URL.
 
 ## How this works (read before building)
 
 LTX-2.3 has **no diffusers integration** — the HF model card says diffusers support
 is "coming soon". The real inference path is Lightricks' own `ltx-pipelines`
 package (github.com/Lightricks/LTX-2), run as a CLI module. The Dockerfile clones
-that repo and `uv sync`s its workspace; `handler.py` shells out to
-`python -m ltx_pipelines.distilled` (the fastest 2-stage pipeline: 8 distilled
-steps, CFG=1, no separate LoRA needed).
+that repo and `uv sync`s its workspace; `app.py` is a small FastAPI server that
+shells out to `python -m ltx_pipelines.distilled` (the fastest 2-stage pipeline:
+8 distilled steps, CFG=1, no separate LoRA needed) and returns the resulting MP4.
 
-### Model weights (~71GB total, downloaded on first cold start)
+### Why a Pod instead of Serverless
+
+RunPod Serverless workers are ephemeral — without a network volume attached
+(which isn't offered for all GPU tiers/regions), the ~71GB of model weights
+would re-download on every cold start, costing 20-40+ minutes per request.
+
+A **Pod** is a persistent machine: you attach a network volume (mounted at
+`/workspace`), the weights download **once** on first request and persist
+across pod stop/start. You start/stop the pod manually (or via RunPod's API)
+to control cost — there's no automatic scale-to-zero like Serverless.
+
+### Model weights (~71GB total, downloaded on first request)
 
 | File | Repo | Size |
 |---|---|---|
@@ -22,16 +33,14 @@ steps, CFG=1, no separate LoRA needed).
 | `ltx-2.3-spatial-upscaler-x2-1.1.safetensors` | `Lightricks/LTX-2.3` | ~1GB |
 | Gemma-3-12B text encoder (5 shards) | `google/gemma-3-12b-it-qat-q4_0-unquantized` | ~24GB |
 
-`handler.py` downloads these via `huggingface_hub` into `LTX_WEIGHTS_DIR`
-(default `/runpod-volume/ltx2-weights`) on first run and reuses them on
-subsequent warm/cold starts as long as a **network volume** is attached. The
-Gemma repo may require accepting its license on HuggingFace and a valid
-`HUGGINGFACE_API_TOKEN` (gated model — see `AI_CONTEXT/KNOWN_PITFALLS.md`).
+`app.py` downloads these via `huggingface_hub` into `LTX_WEIGHTS_DIR`
+(default `/workspace/ltx2-weights`) on the first `/generate` request and
+reuses them on subsequent requests and pod restarts, as long as a **network
+volume is mounted at `/workspace`**. The Gemma repo is gated — you must
+accept its license on HuggingFace and provide a valid `HUGGINGFACE_API_TOKEN`
+(see `AI_CONTEXT/KNOWN_PITFALLS.md`).
 
-### GPU / cost requirements (revised)
-
-The original scaffold assumed a 16-24GB GPU / GGUF quantization — **that was
-wrong for this model**. There is no GGUF build of LTX-2.3 on HuggingFace.
+### GPU / cost requirements
 
 - **bf16 (default)**: distilled transformer (~46GB) + Gemma-3-12B (~24GB) +
   activations ≈ needs an **80GB GPU (A100/H100)**.
@@ -43,79 +52,74 @@ wrong for this model**. There is no GGUF build of LTX-2.3 on HuggingFace.
 
 ## Build & push
 
-```bash
-docker build -t <registry>/<your-namespace>/ltx2-runpod:latest .
-docker push <registry>/<your-namespace>/ltx2-runpod:latest
+This repo's `.github/workflows/build.yml` builds the image via GitHub Actions
+(local Docker builds on Apple Silicon require slow QEMU emulation for the
+`linux/amd64` target) and pushes to Docker Hub:
+
+```
+<your-dockerhub-username>/ltx2-runpod:latest
 ```
 
-Build is slow and disk-heavy: it clones the LTX-2 repo and `uv sync`s a
-PyTorch 2.7 / CUDA 12.8 environment. The model weights are **not** baked into
-the image — they're pulled into the network volume at runtime.
+Trigger it from the GitHub repo's **Actions** tab → **Run workflow**.
 
-## Deploy on RunPod Serverless
+## Deploy on RunPod (Pod)
 
-1. RunPod console → Serverless → New Endpoint.
-2. Container image: `<registry>/<your-namespace>/ltx2-runpod:latest`.
+1. RunPod console → **Pods** → **Deploy**.
+2. Template / Container image: `<your-dockerhub-username>/ltx2-runpod:latest`.
 3. GPU: **80GB tier (A100/H100)** by default; try a 48GB tier only if you set
    `LTX_QUANTIZATION=fp8-scaled-mm`.
-4. **Attach a network volume** (≥100GB) mounted at `/runpod-volume` — this is
-   where the ~71GB of weights are cached. Without it, every cold start
+4. **Attach a network volume** (≥100GB) — mounted at `/workspace`. This is
+   where the ~71GB of weights are cached. Without it, every pod restart
    re-downloads ~71GB.
-5. Workers: **Min = 0** (scale-to-zero — required for "couple hours/day" cost), Max = 1.
-6. Container disk: 30-40GB is enough for the image/venv itself (weights live on
+5. Container disk: 30-40GB is enough for the image/venv itself (weights live on
    the network volume).
-7. Environment variables: set `HUGGINGFACE_API_TOKEN` if the Gemma repo is gated
-   for your account. Other env vars (`LTX_MODEL_REPO`, `LTX_DISTILLED_CHECKPOINT`,
-   `LTX_SPATIAL_UPSCALER`, `GEMMA_MODEL_REPO`, `FPS`, `WIDTH`, `HEIGHT`,
-   `LTX_QUANTIZATION`, `LTX_OFFLOAD_MODE`) have working defaults baked into the
-   Dockerfile — override only if needed.
-8. Save, then copy the **Endpoint ID** and create/copy an **API Key**
-   (RunPod console → Settings → API Keys).
+6. **Expose HTTP port 8000** (RunPod's "Expose HTTP Ports" field) — this gives
+   you a public proxy URL like `https://<pod-id>-8000.proxy.runpod.net`.
+7. Environment variables: set `HUGGINGFACE_API_TOKEN` (Gemma repo is gated —
+   accept its license on HuggingFace first). Other env vars
+   (`LTX_MODEL_REPO`, `LTX_DISTILLED_CHECKPOINT`, `LTX_SPATIAL_UPSCALER`,
+   `GEMMA_MODEL_REPO`, `FPS`, `WIDTH`, `HEIGHT`, `LTX_QUANTIZATION`,
+   `LTX_OFFLOAD_MODE`) have working defaults baked into the Dockerfile —
+   override only if needed.
+8. Deploy. Once running, copy the proxy URL for port 8000 from the pod's
+   **Connect** menu.
 
 ## Wire into n8n
 
 Add to `.env` (and forwarded via `docker-compose.yml` to `n8n`/`n8n-worker`):
 
 ```
-RUNPOD_API_KEY=<your runpod api key>
-RUNPOD_ENDPOINT_ID=<endpoint id from step above>
+LTX2_POD_URL=https://<pod-id>-8000.proxy.runpod.net
 ```
 
 `workflows/video_gen_workflow.json` calls:
 
-- `POST https://api.runpod.ai/v2/$RUNPOD_ENDPOINT_ID/run`
-  body: `{"input": {"prompt": "...", "duration_sec": 4}}`
-  header: `Authorization: Bearer $RUNPOD_API_KEY`
-  → `{"id": "<job_id>", "status": "IN_QUEUE"}`
-- `GET https://api.runpod.ai/v2/$RUNPOD_ENDPOINT_ID/status/<job_id>`
-  → poll until `status` is `COMPLETED` (then `output.video_b64`/`output.error`) or
-  `FAILED`.
+- `POST $LTX2_POD_URL/generate`
+  body: `{"prompt": "...", "duration_sec": 4}`
+  → `{"video_b64": "...", "mime": "video/mp4"}` or `{"error": "..."}`
 
-## Local smoke test (requires an NVIDIA GPU with enough VRAM)
+The request blocks until the clip is generated (a few minutes), so the HTTP
+Request node's timeout is set generously (10 minutes).
+
+## Smoke test
 
 ```bash
-docker run --rm -it --gpus all \
-  -v /path/to/network_volume:/runpod-volume \
-  -e HUGGINGFACE_API_TOKEN=<token if needed> \
-  <registry>/<your-namespace>/ltx2-runpod:latest \
-  /opt/LTX-2/.venv/bin/python3 -c "from handler import handler; import json; \
-print(json.dumps(handler({'input': {'prompt': 'a calm ocean at sunset', 'duration_sec': 2}}))[:200])"
+curl -X POST https://<pod-id>-8000.proxy.runpod.net/generate \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "a calm ocean at sunset", "duration_sec": 2}' \
+  | python3 -c "import sys,json,base64; d=json.load(sys.stdin); open('out.mp4','wb').write(base64.b64decode(d['video_b64']))"
 ```
 
-First run downloads ~71GB of weights into `/runpod-volume` — expect this to
-take a long time depending on bandwidth. Decode `output.video_b64` (base64) to
-an `.mp4` and run `ffprobe` to confirm both a video and an audio stream are
-present.
+First call downloads ~71GB of weights into `/workspace` — expect this to take
+a long time depending on bandwidth. Subsequent calls (and after pod
+stop/start) skip the download. Run `ffprobe out.mp4` to confirm both a video
+and an audio stream are present.
 
 ## Cost notes
 
-RunPod Serverless bills per second of GPU time while a worker is processing a
-request, plus per-second idle-keepalive only if `idleTimeout` keeps a worker warm.
-With `min workers = 0`, on an 80GB tier (~$1.5-2/hr) a clip taking ~2-4 minutes
-costs roughly $0.05-0.15. At "a couple hours/day" total generation time, this
-stays in the low single-digit dollars/day range — higher than the original
-16-24GB estimate, but still scale-to-zero.
-
-Network volume storage (~100GB) is billed continuously (a few cents/GB/month)
-even when no worker is running — this is the trade-off for not re-downloading
-~71GB on every cold start.
+Unlike Serverless, a Pod bills continuously while running (~$1.40/hr for an
+80GB A100, similar to the build/test pod used earlier), regardless of whether
+a request is in flight. **Stop the pod manually** when not generating videos
+to avoid idle billing — only the attached network volume (a few cents/GB/month)
+is billed while stopped. Starting the pod again reuses the cached weights on
+the network volume, so no re-download is needed.
